@@ -1,14 +1,21 @@
 """
 Project routes: create, get, analyze, vote, finalize.
+
+NOTE: PostgreSQL is still used for scoring / voting, but project metadata
+is now also written to Firestore for persistence and dashboard listing.
 """
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Set
+import os
+import re
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+import httpx
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session, joinedload
 
 from config import get_settings
 from database import get_db
+from firebase_client import get_firestore_client
 from models import User, Project, ProjectMember, GitMetrics, Vote, FinalScore
 from routes.auth import require_user_id, optional_user_id
 from schemas import (
@@ -37,7 +44,6 @@ from blockchain_service import (
     hash_score,
     read_app_global_state,
 )
-import os
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 settings = get_settings()
@@ -59,7 +65,9 @@ def create_project(
     db: Session = Depends(get_db),
     user_id: int = Depends(require_user_id),
 ):
-    """Create project, add members by wallet, deploy contract."""
+    """
+    Create project, add members, deploy contract, and mirror metadata to Firestore.
+    """
     # Validate weights sum to 1
     w = body.weight_code + body.weight_time + body.weight_vote
     if abs(w - 1.0) > 0.01:
@@ -69,6 +77,56 @@ def create_project(
     if not creator:
         raise HTTPException(status_code=404, detail="User not found")
 
+    # --- Build members array (manual + GitHub contributors) ---
+    members_set: Set[str] = set()
+
+    # Manual members: split by comma and trim
+    for raw in body.member_wallet_addresses or []:
+        for token in raw.split(","):
+            name = token.strip()
+            if name:
+                members_set.add(name)
+
+    # GitHub contributors (public repos only)
+    owner = repo = None
+    if body.repo_url:
+        m = re.match(r"^https://github\\.com/([^/]+)/([^/]+?)(?:\\.git)?/?$", body.repo_url.strip())
+        if not m:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid GitHub repo URL. Expected https://github.com/{owner}/{repo}",
+            )
+        owner, repo = m.group(1), m.group(2)
+        try:
+            headers = {"Accept": "application/vnd.github+json"}
+            # Optional: use a personal access token if provided to avoid rate limits
+            gh_token = os.getenv("GITHUB_TOKEN") or None
+            if gh_token:
+                headers["Authorization"] = f"Bearer {gh_token}"
+            url = f"https://api.github.com/repos/{owner}/{repo}/contributors"
+            resp = httpx.get(url, headers=headers, timeout=10.0)
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=502, detail="Failed to reach GitHub API") from e
+
+        if resp.status_code == 404:
+            raise HTTPException(
+                status_code=400,
+                detail="GitHub repository not found or not public",
+            )
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"GitHub API error: {resp.status_code}",
+            )
+
+        for item in resp.json():
+            login = item.get("login")
+            if login:
+                members_set.add(login)
+
+    members_list: List[str] = sorted(members_set)
+
+    # --- Persist project in PostgreSQL (for existing logic) ---
     project = Project(
         name=body.name,
         repo_url=body.repo_url,
@@ -85,27 +143,46 @@ def create_project(
     db.refresh(project)
 
     # Add creator as owner
-    db.add(
-        ProjectMember(project_id=project.id, user_id=user_id, role="owner")
-    )
-    # Add members by wallet: find users with those wallets
-    for addr in body.member_wallet_addresses or []:
-        if not addr or addr == (creator.wallet_address or ""):
-            continue
-        u = db.query(User).filter(User.wallet_address == addr).first()
-        if u:
-            pm = ProjectMember(project_id=project.id, user_id=u.id, role="member")
-            db.add(pm)
+    db.add(ProjectMember(project_id=project.id, user_id=user_id, role="owner"))
     db.commit()
+
+    # --- Mirror project to Firestore (primary project document store) ---
+    try:
+        fs = get_firestore_client()
+        doc_ref = fs.collection("projects").document()
+        doc_ref.set(
+            {
+                "id": doc_ref.id,
+                "name": body.name,
+                "description": "",
+                "repoUrl": body.repo_url or "",
+                "members": members_list,
+                "ownerId": user_id,
+                "createdAt": firestore.SERVER_TIMESTAMP,
+            }
+        )
+    except Exception as e:  # pragma: no cover - non-critical path
+        # Do not fail project creation if Firestore is misconfigured; log server-side instead.
+        print("Failed to write project to Firestore:", e)
 
     # Deploy contract if we have creator mnemonic and rep ASA
     if settings.CREATOR_MNEMONIC and settings.REPUTATION_ASA_ID:
         try:
             approval_path = os.path.join(
-                os.path.dirname(__file__), "..", "..", "contracts", "teal", "contribution_approval.teal"
+                os.path.dirname(__file__),
+                "..",
+                "..",
+                "contracts",
+                "teal",
+                "contribution_approval.teal",
             )
             clear_path = os.path.join(
-                os.path.dirname(__file__), "..", "..", "contracts", "teal", "contribution_clear.teal"
+                os.path.dirname(__file__),
+                "..",
+                "..",
+                "contracts",
+                "teal",
+                "contribution_clear.teal",
             )
             if os.path.isfile(approval_path) and os.path.isfile(clear_path):
                 with open(approval_path) as f:
@@ -120,7 +197,9 @@ def create_project(
                     project.id,
                     int(body.deadline_contribution.timestamp()),
                     int(body.deadline_voting.timestamp()),
-                    wc, wt, wv,
+                    wc,
+                    wt,
+                    wv,
                     settings.REPUTATION_ASA_ID,
                     approval_teal,
                     clear_teal,
@@ -130,11 +209,11 @@ def create_project(
                 project.status = "active"
                 db.commit()
                 db.refresh(project)
-        except Exception as e:
+        except Exception:
             # Leave project in draft; contract can be deployed later
             pass
 
-    members = db.query(ProjectMember).filter(ProjectMember.project_id == project.id).all()
+    members_db = db.query(ProjectMember).filter(ProjectMember.project_id == project.id).all()
     return ProjectResponse(
         id=project.id,
         name=project.name,
@@ -148,7 +227,7 @@ def create_project(
         contract_app_id=project.contract_app_id,
         contract_address=project.contract_address,
         created_at=project.created_at,
-        members=[_member_response(m) for m in members],
+        members=[_member_response(m) for m in members_db],
     )
 
 
@@ -456,3 +535,32 @@ def get_final_scores(
             )
         )
     return out
+
+
+@router.get("", response_model=List[dict])
+def list_my_projects_firestore(
+    db: Session = Depends(get_db),
+    user_id: int = Depends(require_user_id),
+):
+    """
+    List projects for the current user from Firestore.
+
+    This allows dashboards to fetch all persisted projects for the
+    logged-in owner (ownerId == user_id).
+    """
+    fs = get_firestore_client()
+    # Late import to avoid circular import at top-level
+    from firebase_admin import firestore as _fs
+
+    query = (
+        fs.collection("projects")
+        .where("ownerId", "==", user_id)
+        .order_by("createdAt", direction=_fs.Query.DESCENDING)
+    )
+    docs = query.stream()
+    projects: List[dict] = []
+    for d in docs:
+        data = d.to_dict() or {}
+        data.setdefault("id", d.id)
+        projects.append(data)
+    return projects

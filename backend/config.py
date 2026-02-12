@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     # Git clone temp dir
     GIT_CLONE_DIR: str = "/tmp/trustchain_repos"
 
+    # Firebase / Firestore
+    FIREBASE_PROJECT_ID: str | None = None
+    FIREBASE_CLIENT_EMAIL: str | None = None
+    FIREBASE_PRIVATE_KEY: str | None = None
+
     class Config:
         env_file = ".env"
         extra = "ignore"
